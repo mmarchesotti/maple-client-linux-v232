@@ -1,0 +1,4 @@
+src/build/
+*.log
+__pycache__/
+maplewindow.txt

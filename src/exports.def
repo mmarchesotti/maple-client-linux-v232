@@ -1,0 +1,5 @@
+LIBRARY Swordie
+EXPORTS
+    ; nmcogame64.dll imports Swordie.dll by ordinal 1; only the slot must exist.
+    ; Export both a friendly name and the original mangled name at ordinal 1.
+    APIDummy_ctor @1
