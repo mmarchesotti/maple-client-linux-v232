@@ -9,14 +9,16 @@
 //   [net] redirect  the login host is a DNS name that resolves to Nexon's servers.
 //                   Any connect() to the Swordie ports (8483, 8484, 8585-8604)
 //                   is diverted to [net] server (default 127.0.0.1).
-//   stack_walk_fix  on every map load, protected code walks the main thread's
-//                   stack down from StackBase, zeroing it. Under Wine that wipes
-//                   live frames. We move the walk to unused stack.
+//   stack_walk_fix  on every map load (and sometimes on other threads), protected
+//                   code walks a thread's stack down from StackBase, zeroing it.
+//                   Under Wine that wipes live frames. We cut the walk short to
+//                   one page of unused stack.
 //
 // Every C++ throw is also logged to maplemods.log with a short backtrace.
 #include "../../sdk/mod_sdk.h"
 #include <cstring>
 #include <cstdio>
+#include <tlhelp32.h>
 
 static const ModContext* C;
 
@@ -157,34 +159,72 @@ static int WINAPI detour_connect(uintptr_t s, const void* name, int namelen) {
     return orig_connect(s, name, namelen);
 }
 
-// ---- Map-load stack-walk fix ([ngs] stack_walk_fix=1) ------------------------
-// On every map load, Themida-virtualised code reached from FUN_14397fb70 runs
+// ---- Stack-walk fix ([ngs] stack_walk_fix=1) ---------------------------------
+// Themida-virtualised code runs
 //   TEB+8 -= 4; *(DWORD*)[TEB+8] = 0;      until TEB+8 reaches TEB StackLimit
-// i.e. it walks the main thread's stack down from StackBase, zeroing it. Under
-// Wine the main stack is [0x12000,0x110000) and the walk wipes the live frames
-// (AV at 0x143a2e600 on Play; ret to 0 / AVs on portals). Fix:
-//  1. int3 on FUN_14397fb70's `sub rsp,0x3b8` (0x14397fb7a). The VEH emulates the
-//     sub and arms DR0 (write watch on this thread's TEB+8) in the context it
-//     returns with. Arming from another thread races with exception-context
-//     restores and is silently lost.
+// i.e. it walks a thread's stack down from StackBase, zeroing it. It runs on the
+// main thread on every map load (reached from FUN_14397fb70), and sometimes on
+// other threads (2026-10-22: a worker died after opening the inventory with bounds
+// [StackLimit,StackLimit), so Wine could not dispatch its exception). Under Wine the
+// stacks are fully committed and the walk wipes the live frames (AV at
+// 0x143a2e600 on Play; ret to 0 / AVs on portals). Fix:
+//  1. Arm DR0 (write watch on the thread's TEB+8) on every thread. Main thread: int3
+//     on FUN_14397fb70's `sub rsp,0x3b8` (0x14397fb7a); the VEH emulates the sub and
+//     arms DR0 in the context it returns with, on every map load (arming the main
+//     thread from another thread raced with exception-context restores and was
+//     silently lost). Other threads: walk_watcher suspends each one and sets DR0.
 //  2. On the first write that starts a walk inside the real stack, move the cursor
-//     to 64 KB below the live rsp so the walk only zeroes unused stack, and drop
-//     DR0 so it runs at full speed. StackLimit is never touched: stack probes read
-//     it, and moving it crashes on portals.
+//     to one page above StackLimit so the walk only zeroes that page, and drop DR0.
+//     Walking all of the unused stack (v2 moved the cursor to rsp-64K) took 3-4 s
+//     per map load in the VM. StackLimit is never touched: stack probes read it, and
+//     moving it crashes on portals.
 //  3. walk_watcher restores StackBase once the cursor reaches StackLimit (3 s stall
-//     fallback). The next map load re-arms DR0 through the int3.
+//     fallback) and re-arms the thread (the main thread at its next map load).
 static const uintptr_t FE_ENTRY_SUB = 0x14397fb7aULL;
 static const uint8_t   FE_ENTRY_BYTES[7] = {0x48,0x81,0xec,0xb8,0x03,0x00,0x00};   // sub rsp,0x3b8
-static const uintptr_t WALK_MARGIN   = 0x10000;
+static const uintptr_t WALK_TAIL     = 0x1000;    // stack left for the walk to zero above StackLimit
+static const uintptr_t WALK_MARGIN   = 0x1000;    // ... and the cursor stays at least this far below rsp
 static const uintptr_t DR7_L0_MASK   = 0xF0003;
 static const uintptr_t DR7_L0_WRITE8 = 1 | (1u << 16) | (3u << 18);
 static bool g_walk_fix = false;
 static PVOID g_veh = nullptr;
-static volatile uintptr_t g_walk_teb = 0;
-static volatile uintptr_t g_real_stackbase = 0, g_real_limit = 0;
-static volatile bool g_walk_active = false;
 static volatile long g_walk_count = 0;
 static uintptr_t g_self_lo = 0, g_self_size = 0;   // this DLL's image range
+
+// One slot per thread. Claimed by the main-thread int3 or by the watcher's thread
+// scan; the VEH only ever looks up its own thread's slot.
+enum { SLOT_REARM, SLOT_ARMED, SLOT_WALKING };
+struct WalkSlot {
+    volatile uintptr_t teb;            // 0 = free
+    volatile uintptr_t base, limit;    // real StackBase; StackLimit when the walk started
+    volatile DWORD tid;
+    volatile LONG state;
+    volatile bool main;                // re-armed by the int3, not by the watcher
+    int tries;                         // watcher: arm attempts left
+    ULONGLONG verify_at;               // watcher: when to check the arm stuck (0 = done)
+    unsigned seen;                     // watcher: last scan that found the thread
+    uintptr_t prev; ULONGLONG since;   // watcher: walk progress
+};
+static const int MAX_SLOTS = 256;
+static WalkSlot g_slots[MAX_SLOTS];
+
+static WalkSlot* find_slot(uintptr_t teb) {
+    for (int i = 0; i < MAX_SLOTS; i++) if (g_slots[i].teb == teb) return &g_slots[i];
+    return nullptr;
+}
+
+static WalkSlot* claim_slot(uintptr_t teb) {
+    if (WalkSlot* s = find_slot(teb)) return s;
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        if (InterlockedCompareExchangePointer((PVOID volatile*)&g_slots[i].teb, (PVOID)teb, nullptr) == nullptr) {
+            WalkSlot* s = &g_slots[i];
+            s->base = *(const uintptr_t*)(teb + 8);
+            s->state = SLOT_REARM; s->main = false; s->tries = 3; s->verify_at = 0; s->prev = 0;
+            return s;
+        }
+    }
+    return nullptr;
+}
 
 static bool on_field_entry_int3(EXCEPTION_POINTERS* ep) {
     CONTEXT* cx = ep->ContextRecord;
@@ -194,10 +234,10 @@ static bool on_field_entry_int3(EXCEPTION_POINTERS* ep) {
     cx->Rsp -= 0x3b8;                                 // the following movs/call ignore flags
     cx->Rip = FE_ENTRY_SUB + sizeof(FE_ENTRY_BYTES);
     uintptr_t teb = (uintptr_t)NtCurrentTeb();
-    if (!g_walk_active) {
-        g_walk_teb       = teb;
-        g_real_stackbase = *(const uintptr_t*)(teb + 8);
-        g_real_limit     = *(const uintptr_t*)(teb + 0x10);
+    if (WalkSlot* s = claim_slot(teb)) {
+        s->main = true;
+        s->tid  = GetCurrentThreadId();
+        if (s->state != SLOT_WALKING) { s->base = *(const uintptr_t*)(teb + 8); s->state = SLOT_ARMED; }
     }
     cx->Dr0 = teb + 8;
     cx->Dr7 = (cx->Dr7 & ~DR7_L0_MASK) | DR7_L0_WRITE8;
@@ -212,52 +252,123 @@ static bool on_stackbase_write(EXCEPTION_POINTERS* ep) {
     // Our own StackBase write below re-triggers DR0 from inside this handler.
     if ((uintptr_t)cx->Rip - g_self_lo < g_self_size) return true;
     PNT_TIB t = (PNT_TIB)NtCurrentTeb();
-    if ((uintptr_t)t != g_walk_teb || g_walk_active) return true;
-    uintptr_t v = (uintptr_t)t->StackBase;
-    uintptr_t safe = ((uintptr_t)cx->Rsp - WALK_MARGIN) & ~(uintptr_t)3;
-    if (v >= g_real_limit && v < g_real_stackbase && v > safe && safe > g_real_limit) {
-        g_walk_active = true;
-        __atomic_signal_fence(__ATOMIC_SEQ_CST);      // keep the flag store before the write
+    WalkSlot* s = find_slot((uintptr_t)t);
+    if (!s || s->state != SLOT_ARMED) return true;
+    uintptr_t v = (uintptr_t)t->StackBase, limit = (uintptr_t)t->StackLimit, rsp = (uintptr_t)cx->Rsp;
+    uintptr_t safe = (limit + WALK_TAIL) & ~(uintptr_t)3;
+    if (safe + WALK_MARGIN > rsp) safe = limit + 4;   // little free stack: let it zero one dword
+    if (v >= limit && v < s->base && v > safe && safe + WALK_MARGIN <= rsp) {
+        s->limit = limit;
+        s->state = SLOT_WALKING;
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);      // keep the state store before the write
         t->StackBase = (PVOID)safe;
         cx->Dr7 &= ~DR7_L0_MASK;
         long k = InterlockedIncrement(&g_walk_count);
-        C->logf("mod_ngs: stack walk #%ld redirected %llx -> %llx (rsp %llx, limit %llx)", k,
-                (unsigned long long)v, (unsigned long long)safe, (unsigned long long)cx->Rsp,
-                (unsigned long long)g_real_limit);
+        C->logf("mod_ngs: stack walk #%ld on %s thread %lx redirected %llx -> %llx (rsp %llx, limit %llx)", k,
+                s->main ? "main" : "worker", (unsigned long)GetCurrentThreadId(), (unsigned long long)v,
+                (unsigned long long)safe, (unsigned long long)rsp, (unsigned long long)limit);
     }
     return true;
 }
 
-static DWORD WINAPI walk_watcher(void*) {
-    uintptr_t prev = 0;
-    ULONGLONG since = 0;
-    int warn_budget = 5;
-    for (;;) {
-        PNT_TIB t = (PNT_TIB)g_walk_teb;
-        if (!t) { Sleep(50); continue; }
-        uintptr_t cur = (uintptr_t)t->StackBase;
-        if (g_walk_active) {
-            ULONGLONG now = GetTickCount64();
-            if (cur != prev) { prev = cur; since = now; }
-            bool done = cur <= g_real_limit + 4, stalled = now - since >= 3000;
-            if (done || stalled) {
-                if (done) Sleep(1);                    // let the final store land
-                t->StackBase = (PVOID)g_real_stackbase;
-                g_walk_active = false;
-                prev = 0;
-                C->logf("mod_ngs: stack walk #%ld %s; StackBase restored to %llx", (long)g_walk_count,
-                        done ? "finished" : "STALLED 3s", (unsigned long long)g_real_stackbase);
-            }
-            Sleep(1);
-        } else {
-            // A walk we did not catch leaves StackBase below its real value.
-            if (cur != g_real_stackbase && warn_budget > 0) {
-                warn_budget--;
-                C->logf("mod_ngs: WARNING main StackBase %llx != %llx outside a redirected walk",
-                        (unsigned long long)cur, (unsigned long long)g_real_stackbase);
-            }
-            Sleep(20);
+// Sets (or, with check_only, verifies) DR0 on another thread. The thread is
+// suspended only around Get/SetThreadContext: nothing in between may take a lock.
+static bool arm_thread(HANDLE h, uintptr_t teb, bool check_only) {
+    if (SuspendThread(h) == (DWORD)-1) return false;
+    CONTEXT c; memset(&c, 0, sizeof(c)); c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    bool ok = false;
+    if (GetThreadContext(h, &c)) {
+        bool ours = c.Dr0 == teb + 8 && (c.Dr7 & DR7_L0_MASK) == DR7_L0_WRITE8;
+        if (ours || check_only) {
+            ok = ours;
+        } else if (!(c.Dr7 & 3)) {                    // leave DR0 alone if someone else uses it
+            c.Dr0 = teb + 8;
+            c.Dr7 = (c.Dr7 & ~DR7_L0_MASK) | DR7_L0_WRITE8;
+            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            ok = SetThreadContext(h, &c) != 0;
         }
+    }
+    ResumeThread(h);
+    return ok;
+}
+
+typedef LONG (NTAPI *NtQueryInformationThread_t)(HANDLE, int, PVOID, ULONG, PULONG);
+struct ThreadBasicInfo { LONG ExitStatus; PVOID TebBaseAddress; PVOID UniqueProcess, UniqueThread; ULONG_PTR AffinityMask; LONG Priority, BasePriority; };
+static NtQueryInformationThread_t p_query_thread = nullptr;
+
+// Arms every thread the watcher hasn't armed yet and frees the slots of threads
+// that exited.
+static void scan_threads(unsigned gen) {
+    DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    int armed = 0;
+    THREADENTRY32 te; te.dwSize = sizeof(te);
+    for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        WalkSlot* s = nullptr;
+        for (int i = 0; i < MAX_SLOTS; i++)
+            if (g_slots[i].teb && g_slots[i].tid == te.th32ThreadID) { s = &g_slots[i]; break; }
+        if (s && s->main) { s->seen = gen; continue; }
+        if (s && s->state == SLOT_ARMED && !s->verify_at) { s->seen = gen; continue; }
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+                              THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        if (!s) {
+            ThreadBasicInfo tbi;
+            if (p_query_thread && p_query_thread(h, 0 /*ThreadBasicInformation*/, &tbi, sizeof(tbi), nullptr) == 0 &&
+                tbi.TebBaseAddress && (s = claim_slot((uintptr_t)tbi.TebBaseAddress)))
+                s->tid = te.th32ThreadID;
+        }
+        if (s) {
+            s->seen = gen;
+            if (s->state == SLOT_REARM && s->tries > 0) {
+                s->tries--;
+                if (arm_thread(h, s->teb, false)) {
+                    s->state = SLOT_ARMED;
+                    s->verify_at = GetTickCount64() + 2000;
+                    armed++;
+                }
+            } else if (s->state == SLOT_ARMED && s->verify_at && GetTickCount64() >= s->verify_at) {
+                s->verify_at = 0;
+                if (!arm_thread(h, s->teb, true)) s->state = SLOT_REARM;   // the arm was lost
+            }
+        }
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        WalkSlot& s = g_slots[i];
+        if (s.teb && !s.main && s.state != SLOT_WALKING && s.tid && s.seen != gen) { s.tid = 0; s.teb = 0; }
+    }
+    if (armed) C->logf("mod_ngs: stack_walk_fix armed on %d more thread(s)", armed);
+}
+
+static DWORD WINAPI walk_watcher(void*) {
+    unsigned gen = 0;
+    ULONGLONG last_scan = 0;
+    for (;;) {
+        bool walking = false;
+        ULONGLONG now = GetTickCount64();
+        for (int i = 0; i < MAX_SLOTS; i++) {
+            WalkSlot& s = g_slots[i];
+            if (!s.teb || s.state != SLOT_WALKING) continue;
+            walking = true;
+            PNT_TIB t = (PNT_TIB)s.teb;
+            uintptr_t cur = (uintptr_t)t->StackBase;
+            if (cur != s.prev) { s.prev = cur; s.since = now; }
+            bool done = cur <= s.limit + 4, stalled = now - s.since >= 3000;
+            if (!done && !stalled) continue;
+            if (done) Sleep(1);                        // let the final store land
+            t->StackBase = (PVOID)s.base;
+            s.prev = 0;
+            s.tries = 3;
+            s.state = s.main ? SLOT_ARMED : SLOT_REARM;
+            C->logf("mod_ngs: stack walk #%ld %s; thread %lx StackBase restored to %llx", (long)g_walk_count,
+                    done ? "finished" : "STALLED 3s", (unsigned long)s.tid, (unsigned long long)s.base);
+        }
+        if (now - last_scan >= 1000) { scan_threads(++gen); last_scan = now; }
+        Sleep(walking ? 1 : 20);
     }
     return 0;
 }
@@ -279,6 +390,9 @@ static bool arm_field_entry_int3() {
 }
 
 static DWORD WINAPI walk_fix_thread(void*) {
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    p_query_thread = nt ? (NtQueryInformationThread_t)GetProcAddress(nt, "NtQueryInformationThread") : nullptr;
+    if (!p_query_thread) C->logf("mod_ngs: NtQueryInformationThread not found; only the main thread is protected");
     if (arm_field_entry_int3()) walk_watcher(nullptr);
     return 0;
 }

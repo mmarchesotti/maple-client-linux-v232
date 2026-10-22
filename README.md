@@ -57,7 +57,9 @@ folder.
 | Startup | null-pointer crash in the GR2D DirectX 9 engine | Wine's builtin `d3dx9_43` | `winetricks d3dx9_43 d3dcompiler_43 d3dcompiler_47` |
 | Startup | fatal `CPatchException`, then an uncaught `ZException` | Nexon's anti-cheat (BlackCipher) can't run under Wine, so the patch/NGS status check fails | `mod_ngs` `patch_throw`: flips `JZ` to `JMP` at `0x14170eec9` so the throw never runs (C++ EH state stays intact) |
 | Login | client connects to Nexon's servers | the login host is a DNS name | `mod_ngs` `[net] redirect`: sends the Swordie ports (8483/8484/8585–8604) to `[net] server` (default `127.0.0.1`) |
-| Play / every map change | window shrinks and darkens, then the client crashes | Themida-protected code walks the main thread's stack down from `StackBase`, zeroing it. Under Wine that wipes live stack frames | `mod_ngs` `stack_walk_fix`: a hardware watchpoint catches the walk and moves it 64 KB below `rsp`, so it only zeroes unused stack. `StackBase` is restored afterwards |
+| Play / every map change | window shrinks and darkens, then the client crashes; map loads take 3–4 s longer | Themida-protected code walks the main thread's stack down from `StackBase`, zeroing it. Under Wine that wipes live stack frames, and the stack is fully committed, so the walk covers ~1 MB | `mod_ngs` `stack_walk_fix`: a hardware watchpoint catches the walk and moves it to one page above `StackLimit`, so it only zeroes that unused page (~15 ms). `StackBase` is restored afterwards |
+| Play (rare) | a worker thread dies, e.g. after opening the inventory (`wine.log`: `Exception frame is not in stack limits`) | the same walk on another thread | `stack_walk_fix` arms the watchpoint on every thread, not just the main one |
+| In-game browser crash | keyboard stops working (arrow keys still move) | Wine's crash dialog for `MapleBrowser_WZ2.exe` takes the keyboard focus | `play.sh` turns the dialog off (`HKCU\Software\Wine\WineDbg` `ShowCrashDialog=0`); crashes are still logged to `wine.log` |
 | Resolution change | squashed picture, offset mouse | Hyprland keeps the floating Xwayland window at the old size | `mod_window` writes the requested size to `maplewindow.txt`; `maple_winsync.py` resizes the window via `hyprctl` |
 
 All options are in `maplemods.ini`. On **Windows**, `play.sh` doesn't apply:
@@ -79,10 +81,8 @@ rename `Swordie.dll` to `Swordie_orig.dll` and `maplemods_loader.dll` to
   only works on Hyprland. Elsewhere, resize the window by hand if the picture
   looks squashed after login.
 - **In-game browser:** the client's CEF browser (`MapleBrowser_WZ2.exe`) crashes
-  under Wine, so the event and guide pop-ups stay blank and Wine shows a crash
-  dialog. The game keeps running; close the dialog and the pop-ups.
-- Map loads take about 3 s longer than on Windows. The fix doesn't cause this;
-  the stack walk itself does.
+  under Wine, so the event and guide pop-ups stay blank. The game keeps running;
+  close the pop-ups.
 
 ## Building from source (optional)
 
@@ -97,7 +97,8 @@ bash src/build.sh                 # -> src/build/{maplemods_loader.dll,maplemods
 Set `CROSS` to use a specific toolchain prefix, e.g.
 `CROSS=/opt/w64devkit/bin/x86_64-w64-mingw32- bash src/build.sh`. Copy the
 output over `dist/` (or straight into your client folder) and run `play.sh`. The
-DLLs in `dist/` were built with GCC 16.2 (w64devkit).
+DLLs in `dist/` were built with GCC 16.2 (w64devkit, and the Arch `mingw-w64-gcc`
+package for `mod_ngs.dll`).
 
 ### How it loads
 

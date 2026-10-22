@@ -23,6 +23,11 @@ if ! grep -qs '"d3dx9_43"="native' "$WINEPREFIX/user.reg"; then
     echo "Setting up Wine prefix $WINEPREFIX (first run only, takes a few minutes)..."
     winetricks -q d3dx9_43 d3dcompiler_43 d3dcompiler_47 || die "winetricks failed."
 fi
+# The in-game browser crashes under Wine, and Wine's crash dialog takes the keyboard
+# focus from the game. Keep the crash in wine.log only.
+if ! grep -qs '"ShowCrashDialog"=dword:00000000' "$WINEPREFIX/user.reg"; then
+    wine reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f > /dev/null 2>&1
+fi
 
 # 2. Mod loader. The client loads Swordie.dll; our loader takes that name and
 #    chain-loads the original AuthHook from Swordie_orig.dll.
